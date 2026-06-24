@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>心拍・血中酸素・HRV モニター · XIAO ESP32-C6 (BLE 生波形)</title>
+<style>
+  :root{
+    --bg:#0f1117; --card:#1a1d28; --card2:#222637; --line:#2c3146;
+    --txt:#e8eaf0; --mut:#8b91a7; --red:#ff5470; --blue:#46c2ff;
+    --grn:#3ddc84; --yel:#ffcf5c; --accent:#6c8cff; --purple:#b48cff;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,"Segoe UI",Roboto,"Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,sans-serif;
+       background:var(--bg);color:var(--txt);min-height:100vh;padding:18px;line-height:1.5}
+  .wrap{max-width:980px;margin:0 auto}
+  header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:18px}
+  h1{font-size:19px;font-weight:600}
+  h1 span{color:var(--mut);font-weight:400;font-size:13px;display:block;margin-top:2px}
+  .conn{display:flex;align-items:center;gap:10px}
+  .dot{width:10px;height:10px;border-radius:50%;background:#555;transition:.3s}
+  .dot.on{background:var(--grn);box-shadow:0 0 10px var(--grn)} .dot.warn{background:var(--yel)}
+  button{font:inherit;font-weight:600;cursor:pointer;border:none;border-radius:10px;padding:9px 16px;background:var(--accent);color:#fff;transition:.2s}
+  button:hover{filter:brightness(1.12)} button:disabled{opacity:.45;cursor:not-allowed}
+  button.ghost{background:var(--card2);color:var(--txt);padding:6px 12px;font-size:13px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+  .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px}
+  .sec-title{font-size:14px;font-weight:600;color:var(--mut);margin:6px 2px 10px}
+  .big .label{color:var(--mut);font-size:13px;margin-bottom:6px}
+  .big .val{font-size:58px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1}
+  .big .unit{font-size:17px;color:var(--mut);font-weight:500;margin-left:6px}
+  .big.hr .val{color:var(--red)} .big.o2 .val{color:var(--blue)}
+  .mini{text-align:center;padding:13px}
+  .mini .label{color:var(--mut);font-size:12px;margin-bottom:5px}
+  .mini .val{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}
+  .mini .sub{font-size:11px;color:var(--mut);margin-top:2px}
+  .badge{display:inline-block;padding:2px 10px;border-radius:20px;font-size:13px;font-weight:600}
+  .badge.ok{background:rgba(61,220,132,.15);color:var(--grn)} .badge.no{background:rgba(255,84,112,.15);color:var(--red)}
+  .gauge-wrap{margin-top:6px}
+  .gauge{position:relative;height:18px;border-radius:9px;background:linear-gradient(90deg,#ff5470 0%,#ffcf5c 50%,#3ddc84 100%)}
+  .gauge-marker{position:absolute;top:-4px;width:4px;height:26px;border-radius:2px;background:#fff;box-shadow:0 0 6px rgba(0,0,0,.6);left:50%;transition:left .5s}
+  .gauge-labels{display:flex;justify-content:space-between;color:var(--mut);font-size:12px;margin-top:6px}
+  .gauge-labels b{color:var(--txt)}
+  canvas{width:100%;display:block;background:var(--card);border:1px solid var(--line);border-radius:14px}
+  .chartbox .cap{font-size:12px;color:var(--mut);margin:0 2px 6px}
+  .loghead{display:flex;align-items:center;justify-content:space-between;margin:2px 2px 8px}
+  .loghead .ttl{font-size:14px;font-weight:600;color:var(--mut)}
+  .logctl{display:flex;gap:8px}
+  #log{height:180px;overflow-y:auto;background:#0b0d13;border:1px solid var(--line);border-radius:12px;padding:10px;font-family:"SF Mono",Menlo,Consolas,monospace;font-size:12px;line-height:1.45;white-space:pre-wrap;color:#b9c0d4}
+  #log .beat{color:var(--grn)}
+  .note{margin-top:16px;padding:13px 15px;background:var(--card2);border-radius:12px;color:var(--mut);font-size:13px;border:1px solid var(--line)}
+  .note b{color:var(--txt)}
+  .err{background:rgba(255,84,112,.12);border-color:var(--red);color:#ffb3bf}
+  .hide{display:none}
+  @media(max-width:680px){.grid2,.grid4{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>心拍・血中酸素・HRV モニター<span>XIAO ESP32-C6 · BLE 生波形ストリーム(解析はブラウザ側)</span></h1>
+    <div class="conn">
+      <span class="dot" id="dot"></span>
+      <span id="status" style="color:var(--mut);font-size:14px">未接続</span>
+      <button id="btn">接続</button>
+    </div>
+  </header>
+
+  <div id="unsupported" class="note err hide">
+    ⚠️ このブラウザは <b>Web Bluetooth</b> 非対応です。<b>Chrome</b> または <b>Edge</b>(Windows / macOS / Linux)をご利用ください。
+  </div>
+
+  <!-- 生 PPG 波形 -->
+  <div class="card chartbox" style="margin-bottom:14px">
+    <div class="cap">脈波(PPG 生波形)— 緑点＝検出した心拍ピーク &nbsp; <span id="sps" style="color:var(--grn)"></span></div>
+    <canvas id="wave" width="940" height="150"></canvas>
+  </div>
+
+  <!-- バイタル -->
+  <div class="grid2">
+    <div class="card big hr"><div class="label">心拍数</div><div><span class="val" id="bpm">--</span><span class="unit">BPM</span></div></div>
+    <div class="card big o2"><div class="label">血中酸素 SpO₂ <span style="font-size:11px;color:var(--mut)">(R比値・参考)</span></div><div><span class="val" id="spo2">--</span><span class="unit">%</span></div></div>
+  </div>
+  <div class="grid4">
+    <div class="card mini"><div class="label">指</div><div class="val"><span id="finger" class="badge no">なし</span></div></div>
+    <div class="card mini"><div class="label">ストリーム</div><div class="val"><span id="sensor" class="badge no">オフライン</span></div></div>
+    <div class="card mini"><div class="label">IR 生値</div><div class="val" id="ir">--</div></div>
+    <div class="card mini"><div class="label">最終更新</div><div class="val" id="age">--</div></div>
+  </div>
+
+  <!-- HRV -->
+  <div class="sec-title">心拍変動 HRV(時間領域・ブラウザ計算)</div>
+  <div class="grid4">
+    <div class="card mini"><div class="label">平均 RR 間隔</div><div class="val" id="meanrr">--</div><div class="sub">ms</div></div>
+    <div class="card mini"><div class="label">RMSSD</div><div class="val" id="rmssd">--</div><div class="sub">ms(副交感の指標)</div></div>
+    <div class="card mini"><div class="label">pNN50</div><div class="val" id="pnn50">--</div><div class="sub">%</div></div>
+    <div class="card mini"><div class="label">SDNN</div><div class="val" id="sdnn">--</div><div class="sub">ms</div></div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <div class="label" style="color:var(--mut);font-size:13px;margin-bottom:4px">リラックス度 <span id="relaxState" style="color:var(--txt);font-weight:600"></span> <span style="color:var(--mut);font-size:11px">(RMSSD ベース・参考値)</span></div>
+    <div class="gauge-wrap">
+      <div class="gauge"><div class="gauge-marker" id="relaxMarker"></div></div>
+      <div class="gauge-labels"><b>緊張</b><span id="relaxPct">--</span><b>リラックス</b></div>
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div class="card chartbox"><div class="cap">RR トレンド(タコグラム)</div><canvas id="tacho" width="940" height="180"></canvas></div>
+    <div class="card chartbox"><div class="cap">ポアンカレプロット RRₙ vs RRₙ₊₁(SD1/SD2)</div><canvas id="poincare" width="940" height="180"></canvas></div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <div class="loghead">
+      <span class="ttl">ログ(受信パケット・リアルタイム)</span>
+      <div class="logctl">
+        <button class="ghost" id="logPause">一時停止</button>
+        <button class="ghost" id="logClear">クリア</button>
+        <button class="ghost" id="logCsv">CSV 保存(生サンプル)</button>
+      </div>
+    </div>
+    <div id="log"></div>
+  </div>
+
+  <div class="note">
+    <b>使い方:</b>「接続」→ <b>XIAO-HR</b> 選択 → 指先を光窓にやさしく当てて静止。上の脈波が動き出し、数秒で緑のピーク点と心拍・SpO₂・HRV が出ます。<br>
+    <b>構成:</b> ESP32 は生サンプル(IR/RED, 100Hz)を BLE で流すだけ。心拍検出・RR・HRV・SpO₂ はすべてこのページ(PC)で計算します。アルゴリズム変更に再書き込み不要。<br>
+    <b>対応:</b> Chrome / Edge(Win・Mac・Linux)。医療用途ではありません。
+  </div>
+</div>
+
+<script>
+const SVC='12345678-1234-5678-1234-56789abcdef0';
+const CHR='12345678-1234-5678-1234-56789abcdef1';
+const FS=100;                  // 固件と一致(有効サンプリング100Hz)
+const FINGER_TH=50000;
+const $=id=>document.getElementById(id);
+
+let device=null, characteristic=null, lastTs=0;
+let wantConnected=false, reconnecting=false;   // 自动重连用
+
+// ---- ストリーム/検出 状態 ----
+let nextIdx=null;             // 次に期待するサンプル番号(欠落検出)
+let dcEMA=null, acLP=0, acP2=0, acP1=0;   // 検出フィルタ
+let envPos=0, envNeg=0, lastPeakIdx=null;
+let beatCount=0;
+let rrSeries=[];             // {idx,rr}
+let wave=[];                 // {idx,v,beat,finger} 表示用
+let spIR=[], spRED=[];       // SpO2 用リングバッファ
+let lastIRv=0, lastFinger=false, sampleClock=0, spsCount=0, curSpo2=null;
+let logRows=[], logPaused=false;
+const WIN=60;                // HRV 計算ビート数
+
+// ---- 検出パラメータ(ここを変えるだけで調整可・再書き込み不要)----
+const P={ dcAlpha:0.005, lpAlpha:0.4, envDecay:0.995, thrFrac:0.55, ampFloor:200, refractoryMs:300 };
+
+if(!navigator.bluetooth){ $('unsupported').classList.remove('hide'); $('btn').disabled=true; }
+$('btn').addEventListener('click',()=>device?disconnect():connect());
+$('logPause').addEventListener('click',()=>{logPaused=!logPaused;$('logPause').textContent=logPaused?'再開':'一時停止';});
+$('logClear').addEventListener('click',()=>{$('log').innerHTML='';});
+$('logCsv').addEventListener('click',exportCsv);
+
+// GATT 接続 + 通知購読(初回・再接続で共用)
+async function gattConnect(){
+  const server=await device.gatt.connect();
+  const svc=await server.getPrimaryService(SVC);
+  characteristic=await svc.getCharacteristic(CHR);
+  await characteristic.startNotifications();
+  characteristic.removeEventListener('characteristicvaluechanged',onPacket);
+  characteristic.addEventListener('characteristicvaluechanged',onPacket);
+}
+async function connect(){
+  try{
+    setStatus('warn','デバイス選択中…');
+    device=await navigator.bluetooth.requestDevice({filters:[{namePrefix:'XIAO'}],optionalServices:[SVC]});
+    device.addEventListener('gattserverdisconnected',onDisconnect);
+    wantConnected=true;
+    setStatus('warn','接続中…');
+    await gattConnect();
+    setStatus('on','接続済み'); $('btn').textContent='切断';
+    resetAll();
+  }catch(e){ console.error(e); setStatus('','接続失敗: '+(e.message||e)); device=null; wantConnected=false; }
+}
+function disconnect(){ wantConnected=false; if(device&&device.gatt.connected) device.gatt.disconnect(); }
+function onDisconnect(){
+  $('dot').className='dot'; characteristic=null;
+  if(wantConnected && device){ setStatus('warn','再接続中…'); reconnectLoop(); }
+  else { setStatus('','切断されました'); $('btn').textContent='接続'; device=null; }
+}
+// 自動再接続: 切断されても接続済み状態を望む限り無限リトライ(手動「切断」のみ停止)
+async function reconnectLoop(){
+  if(reconnecting) return; reconnecting=true;
+  while(wantConnected && device){
+    try{ await gattConnect(); setStatus('on','接続済み(再接続)'); $('btn').textContent='切断'; reconnecting=false; return; }
+    catch(e){ setStatus('warn','再接続待ち…'); await new Promise(r=>setTimeout(r,1500)); }
+  }
+  reconnecting=false;
+}
+function setStatus(s,t){ $('status').textContent=t; $('dot').className='dot'+(s?(' '+s):''); }
+function resetAll(){ nextIdx=null; dcEMA=null; acLP=acP2=acP1=0; envPos=envNeg=0; lastPeakIdx=null; beatCount=0; rrSeries=[]; wave=[]; spIR=[]; spRED=[]; curSpo2=null; clearHRV(); }
+function resetContinuity(){ dcEMA=null; acLP=acP2=acP1=0; envPos=envNeg=0; lastPeakIdx=null; }
+
+// ---- パケット受信(二進制小端: [u32 firstIdx][u8 n][n×(u32 ir,u32 red)]) ----
+function onPacket(e){
+  const dv=e.target.value; lastTs=Date.now();
+  if(dv.byteLength<5) return;
+  const first=dv.getUint32(0,true), n=dv.getUint8(4);
+  if(nextIdx!==null && first!==nextIdx){ resetContinuity(); }   // 欠落/再起動で番号が飛んだら連続性リセット
+  let lastIr=0,lastRed=0;
+  for(let i=0;i<n;i++){
+    const off=5+i*8; if(off+8>dv.byteLength) break;
+    const ir=dv.getUint32(off,true), red=dv.getUint32(off+4,true);
+    processSample(first+i, ir, red);
+    lastIr=ir; lastRed=red; spsCount++;
+  }
+  nextIdx=first+n;
+  logRows.push({idx:first,n:n,ir:lastIr,red:lastRed});
+  appendLog(`idx=${first} n=${n} IR=${lastIr} RED=${lastRed}`, '');
+}
+
+// ---- 1サンプル処理: 心拍検出 + バッファ ----
+function processSample(idx, ir, red){
+  const finger = ir>FINGER_TH;
+  lastIRv=ir; lastFinger=finger;
+
+  // SpO2 リングバッファ(直近~4s)
+  spIR.push(ir); spRED.push(red);
+  if(spIR.length>400){ spIR.shift(); spRED.shift(); }
+
+  if(!finger){ resetContinuity(); pushWave(idx,0,false,false); return; }
+
+  // --- 心拍検出 ---
+  if(dcEMA===null) dcEMA=ir;
+  dcEMA += (ir-dcEMA)*P.dcAlpha;          // 遅い直流追従(脈を消さない)
+  const ac = ir-dcEMA;
+  acLP += (ac-acLP)*P.lpAlpha;            // 低通平滑
+  envPos*=P.envDecay; if(acLP>envPos) envPos=acLP;
+  envNeg*=P.envDecay; if(acLP<envNeg) envNeg=acLP;
+  const amp=envPos-envNeg;
+  const thr=envNeg+P.thrFrac*amp;
+
+  let isBeat=false;
+  // acP1(中央=idx-1)が局所極大かつ閾値超え
+  if(amp>P.ampFloor && acP1>thr && acP1>acP2 && acP1>=acLP){
+    const denom=acP2-2*acP1+acLP;
+    let off=denom!==0?0.5*(acP2-acLP)/denom:0;
+    off=Math.max(-1,Math.min(1,off));
+    const peakIdx=(idx-1)+off;
+    if(lastPeakIdx!==null){
+      const rr=(peakIdx-lastPeakIdx)/FS*1000;
+      if(rr>=P.refractoryMs && rr<=2000){ recordBeat(idx,rr); lastPeakIdx=peakIdx; isBeat=true; }
+      else if(rr>2000){ lastPeakIdx=peakIdx; }   // 長い空白後は再同期
+      // rr<refractory: 重搏切痕/雑音として無視
+    } else { lastPeakIdx=peakIdx; }
+  }
+  acP2=acP1; acP1=acLP;
+  pushWave(idx, acLP, isBeat, true);
+}
+
+function recordBeat(idx, rr){
+  if(acceptRR(rr)){
+    rrSeries.push({idx,rr}); if(rrSeries.length>600) rrSeries.shift();
+    beatCount++;
+    appendLog(`♥ ピーク検出  rr=${Math.round(rr)}ms  (~${Math.round(60000/rr)} BPM)`, 'beat');
+    updateHRV();
+  }
+}
+function acceptRR(rr){
+  if(rr<300||rr>2000) return false;
+  if(rrSeries.length>=5){
+    const recent=rrSeries.slice(-11).map(x=>x.rr).sort((a,b)=>a-b);
+    const med=recent[Math.floor(recent.length/2)];
+    if(Math.abs(rr-med)>0.3*med) return false;
+  }
+  return true;
+}
+function pushWave(idx,v,beat,finger){ wave.push({idx,v,beat,finger}); if(wave.length>500) wave.shift(); }
+
+// ---- SpO2 (R比値) ----
+function computeSpo2(){
+  if(spIR.length<150) return null;
+  const ir=spIR.slice(-300), red=spRED.slice(-300);
+  const dcIr=mean(ir), dcRed=mean(red);
+  if(dcIr<FINGER_TH) return null;
+  const acIr=rms(ir,dcIr), acRed=rms(red,dcRed);
+  if(acIr<20||acRed<20) return null;
+  const R=(acRed/dcRed)/(acIr/dcIr);
+  let s=110-25*R;
+  return Math.max(70,Math.min(100,Math.round(s)));
+}
+function mean(a){ let s=0; for(const x of a) s+=x; return s/a.length; }
+function rms(a,m){ let s=0; for(const x of a) s+=(x-m)*(x-m); return Math.sqrt(s/a.length); }
+
+// ---- HRV ----
+function computeHRV(rr){
+  const n=rr.length; if(n<2) return null;
+  const mn=rr.reduce((a,b)=>a+b,0)/n;
+  const sdnn=Math.sqrt(rr.reduce((a,b)=>a+(b-mn)**2,0)/n);
+  const diffs=[]; for(let i=1;i<n;i++) diffs.push(rr[i]-rr[i-1]);
+  let nn50=0; for(const d of diffs) if(Math.abs(d)>50) nn50++;
+  const rmssd=Math.sqrt(diffs.reduce((a,b)=>a+b*b,0)/diffs.length);
+  const pnn50=100*nn50/diffs.length;
+  const dm=diffs.reduce((a,b)=>a+b,0)/diffs.length;
+  const sdsd=Math.sqrt(diffs.reduce((a,b)=>a+(b-dm)**2,0)/diffs.length);
+  const sd1=Math.sqrt(0.5)*sdsd, sd2=Math.sqrt(Math.max(0,2*sdnn*sdnn-sd1*sd1));
+  return {n,mean:mn,sdnn,rmssd,pnn50,hr:60000/mn,sd1,sd2};
+}
+function updateHRV(){
+  const arr=rrSeries.slice(-WIN).map(x=>x.rr);
+  if(arr.length>=2){ const h=computeHRV(arr); $('bpm').textContent=Math.round(h.hr); }
+  if(arr.length<5){ $('relaxState').textContent='測定中 ('+arr.length+'/5+)'; drawTacho(arr); drawPoincare(arr); return; }
+  const h=computeHRV(arr);
+  $('meanrr').textContent=Math.round(h.mean); $('rmssd').textContent=h.rmssd.toFixed(1);
+  $('pnn50').textContent=h.pnn50.toFixed(0); $('sdnn').textContent=h.sdnn.toFixed(1);
+  const pct=Math.max(0,Math.min(100,(h.rmssd-15)/(70-15)*100));
+  $('relaxMarker').style.left=pct+'%'; $('relaxPct').textContent=Math.round(pct)+'%';
+  $('relaxState').textContent=pct<33?'緊張ぎみ':pct<66?'ふつう':'リラックス';
+  drawTacho(arr); drawPoincare(arr);
+}
+function clearHRV(){ ['bpm','meanrr','rmssd','pnn50','sdnn'].forEach(id=>$(id).textContent='--');
+  $('relaxPct').textContent='--'; $('relaxState').textContent=''; $('relaxMarker').style.left='50%'; drawTacho([]); drawPoincare([]); }
+
+// ---- ログ / CSV ----
+function appendLog(text, cls){
+  if(logPaused) return;
+  const el=$('log'), d=new Date();
+  const ts=`${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}.${String(d.getMilliseconds()).padStart(3,'0')}`;
+  const line=document.createElement('div');
+  line.innerHTML=`<span style="color:#5b6478">${ts}</span> <span class="${cls||''}">${text}</span>`;
+  el.appendChild(line); while(el.childNodes.length>200) el.removeChild(el.firstChild); el.scrollTop=el.scrollHeight;
+}
+function exportCsv(){
+  const head='first_idx,count,last_ir,last_red\n';
+  const body=logRows.map(r=>`${r.idx},${r.n},${r.ir},${r.red}`).join('\n');
+  const blob=new Blob([head+body],{type:'text/csv'}); const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob); a.download='ppg_'+new Date().toISOString().replace(/[:.]/g,'-')+'.csv'; a.click();
+}
+
+// ---- 定期更新(SpO2 / 指 / sps / age)----
+setInterval(()=>{
+  curSpo2=computeSpo2();
+  $('spo2').textContent=(lastFinger&&curSpo2!=null)?curSpo2:'--';
+  $('finger').textContent=lastFinger?'あり':'なし'; $('finger').className='badge '+(lastFinger?'ok':'no');
+  $('ir').textContent=lastIRv?lastIRv.toLocaleString():'--';
+  const online=lastTs&&(Date.now()-lastTs<2000);
+  $('sensor').textContent=online?'オンライン':'オフライン'; $('sensor').className='badge '+(online?'ok':'no');
+  $('sps').textContent=online?('受信 '+spsCount+' サンプル/秒'):''; spsCount=0;
+  if(!lastFinger){ $('bpm').textContent='--'; }
+  drawWave();
+},1000);
+setInterval(()=>{ if(!lastTs){$('age').textContent='--';return;} const s=Math.round((Date.now()-lastTs)/1000); $('age').textContent=s<1?'今':(s+'秒前'); },500);
+
+// ---- 描画 ----
+function axes(ctx,W,H,pad){ ctx.clearRect(0,0,W,H); ctx.strokeStyle='#2c3146'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(pad,H-pad); ctx.lineTo(W-pad,H-pad); ctx.moveTo(pad,pad); ctx.lineTo(pad,H-pad); ctx.stroke(); }
+function drawWave(){
+  const cv=$('wave'),ctx=cv.getContext('2d'),W=cv.width,H=cv.height,pad=10; ctx.clearRect(0,0,W,H);
+  if(wave.length<2) return;
+  const vs=wave.map(p=>p.v); const lo=Math.min(...vs),hi=Math.max(...vs),rng=Math.max(200,hi-lo);
+  ctx.strokeStyle='#46c2ff'; ctx.lineWidth=2; ctx.beginPath();
+  wave.forEach((p,i)=>{ const x=pad+i/(wave.length-1)*(W-2*pad); const y=H-pad-((p.v-lo)/rng)*(H-2*pad);
+    i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+  ctx.stroke();
+  ctx.fillStyle='#3ddc84';
+  wave.forEach((p,i)=>{ if(p.beat){ const x=pad+i/(wave.length-1)*(W-2*pad); const y=H-pad-((p.v-lo)/rng)*(H-2*pad);
+    ctx.beginPath(); ctx.arc(x,y,4,0,7); ctx.fill(); } });
+}
+function drawTacho(arr){
+  const cv=$('tacho'),ctx=cv.getContext('2d'),W=cv.width,H=cv.height,pad=26; axes(ctx,W,H,pad);
+  if(arr.length<2) return;
+  const lo=Math.min(...arr),hi=Math.max(...arr),rng=Math.max(40,hi-lo);
+  ctx.fillStyle='#8b91a7'; ctx.font='11px sans-serif'; ctx.fillText(Math.round(hi)+'ms',4,pad+4); ctx.fillText(Math.round(lo)+'ms',4,H-pad);
+  ctx.strokeStyle='#b48cff'; ctx.lineWidth=2; ctx.beginPath();
+  arr.forEach((v,i)=>{ const x=pad+i/(arr.length-1)*(W-2*pad); const y=H-pad-((v-lo)/rng)*(H-2*pad); i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+  ctx.stroke(); ctx.fillStyle='#b48cff';
+  arr.forEach((v,i)=>{ const x=pad+i/(arr.length-1)*(W-2*pad); const y=H-pad-((v-lo)/rng)*(H-2*pad); ctx.beginPath(); ctx.arc(x,y,2,0,7); ctx.fill(); });
+}
+function drawPoincare(arr){
+  const cv=$('poincare'),ctx=cv.getContext('2d'),W=cv.width,H=cv.height,pad=30; axes(ctx,W,H,pad);
+  if(arr.length<3) return;
+  const lo=Math.min(...arr)-20,hi=Math.max(...arr)+20,rng=Math.max(60,hi-lo);
+  const X=v=>pad+((v-lo)/rng)*(W-2*pad), Y=v=>H-pad-((v-lo)/rng)*(H-2*pad);
+  ctx.strokeStyle='#384055'; ctx.setLineDash([4,4]); ctx.beginPath(); ctx.moveTo(X(lo),Y(lo)); ctx.lineTo(X(hi),Y(hi)); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle='#46c2ff';
+  for(let i=0;i<arr.length-1;i++){ ctx.beginPath(); ctx.arc(X(arr[i]),Y(arr[i+1]),2.5,0,7); ctx.fill(); }
+  const h=computeHRV(arr);
+  if(h){ const cx=X(h.mean),cy=Y(h.mean),sc=(W-2*pad)/rng;
+    ctx.save(); ctx.translate(cx,cy); ctx.rotate(-Math.PI/4); ctx.strokeStyle='#ffcf5c'; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.ellipse(0,0,h.sd2*sc,h.sd1*sc,0,0,7); ctx.stroke(); ctx.restore();
+    ctx.fillStyle='#8b91a7'; ctx.font='11px sans-serif'; ctx.fillText('SD1='+h.sd1.toFixed(1)+'  SD2='+h.sd2.toFixed(1)+' ms',pad+6,pad+6); }
+}
+drawWave(); drawTacho([]); drawPoincare([]);
+</script>
+</body>
+</html>

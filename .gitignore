@@ -1,0 +1,20 @@
+# oh-my-claudecode / session state
+.omc/
+**/.omc/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Arduino / arduino-cli build artifacts
+build/
+**/build/
+*.bin
+*.elf
+*.hex
+*.map
+
+# editor / misc
+.vscode/
+.idea/
+*.log
