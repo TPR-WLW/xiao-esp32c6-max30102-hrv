@@ -79,13 +79,22 @@ BLEServer* pServer = nullptr;
 BLECharacteristic* pChar = nullptr;
 volatile bool deviceConnected = false, oldDeviceConnected = false;
 class ServerCB : public BLEServerCallbacks {
-  // 带 param 的重载会随连接事件一并被调用, 可拿到对端地址
+  void onConnect(BLEServer*)    override { deviceConnected = true; }
+  void onDisconnect(BLEServer*) override { deviceConnected = false; }
+  // 连接时主动请求较快稳定的连接间隔(15~30ms, 0 从机延迟, 4s 超时), 降低数据延迟。
+  // C6(arduino-esp32 3.x) 的 BLE 后端是 NimBLE, 回调参数为 ble_gap_conn_desc;
+  // 同时保留 Bluedroid 写法以便移植到经典 ESP32。
+#if defined(CONFIG_NIMBLE_ENABLED)
+  void onConnect(BLEServer* s, ble_gap_conn_desc* desc) override {
+    deviceConnected = true;
+    s->updateConnParams(desc->conn_handle, 0x0C, 0x18, 0, 400);
+  }
+#elif defined(CONFIG_BLUEDROID_ENABLED)
   void onConnect(BLEServer* s, esp_ble_gatts_cb_param_t* param) override {
     deviceConnected = true;
-    // 主动请求较快且稳定的连接间隔(15~30ms, 0 从机延迟, 4s 超时), 降低数据延迟
     s->updateConnParams(param->connect.remote_bda, 0x0C, 0x18, 0, 400);
   }
-  void onDisconnect(BLEServer*) override { deviceConnected = false; }
+#endif
 };
 
 bool initSensor() {
