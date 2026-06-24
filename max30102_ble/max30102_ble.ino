@@ -39,7 +39,7 @@ bool sensorOk = false;
 unsigned long lastSensorRetry = 0, lastSampleMs = 0;
 
 // ---- 批量打包 ----
-const int BATCH = 16;                 // 每包样本数 -> 约 6 包/秒(更少通知=更小 BLE 压力)
+const int BATCH = 8;                  // 每包样本数 -> 约 12.5 包/秒(80ms 缓冲, 兼顾低延迟与 BLE 压力)
 uint32_t batchIR[BATCH], batchRED[BATCH];
 int      batchN = 0;
 uint32_t sampleIndex = 0;             // 绝对样本序号
@@ -54,7 +54,12 @@ BLEServer* pServer = nullptr;
 BLECharacteristic* pChar = nullptr;
 volatile bool deviceConnected = false, oldDeviceConnected = false;
 class ServerCB : public BLEServerCallbacks {
-  void onConnect(BLEServer*)    override { deviceConnected = true; }
+  // 带 param 的重载会随连接事件一并被调用, 可拿到对端地址
+  void onConnect(BLEServer* s, esp_ble_gatts_cb_param_t* param) override {
+    deviceConnected = true;
+    // 主动请求较快且稳定的连接间隔(15~30ms, 0 从机延迟, 4s 超时), 降低数据延迟
+    s->updateConnParams(param->connect.remote_bda, 0x0C, 0x18, 0, 400);
+  }
   void onDisconnect(BLEServer*) override { deviceConnected = false; }
 };
 
@@ -79,25 +84,44 @@ void initBLE() {
   BLEAdvertising* adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(SVC_UUID);
   adv->setScanResponse(true);
-  adv->setMinPreferred(0x06); adv->setMinPreferred(0x12);
+  adv->setMinPreferred(0x06); adv->setMaxPreferred(0x12);   // 7.5~22.5ms 偏好(原代码两次都是 setMin, 漏了 setMax)
   BLEDevice::startAdvertising();
 }
 
-void sendBatch() {
-  // 组二进制小端包
+// 发送 [base, base+n) 这段连续样本为一个 notify 包(二进制小端)
+void notifyChunk(uint32_t firstAbs, int base, int n) {
   static uint8_t pkt[5 + BATCH * 8];
-  uint32_t first = sampleIndex - batchN;
-  pkt[0] = first & 0xFF; pkt[1] = (first >> 8) & 0xFF;
-  pkt[2] = (first >> 16) & 0xFF; pkt[3] = (first >> 24) & 0xFF;
-  pkt[4] = (uint8_t)batchN;
+  pkt[0] = firstAbs & 0xFF; pkt[1] = (firstAbs >> 8) & 0xFF;
+  pkt[2] = (firstAbs >> 16) & 0xFF; pkt[3] = (firstAbs >> 24) & 0xFF;
+  pkt[4] = (uint8_t)n;
   int off = 5;
-  for (int i = 0; i < batchN; i++) {
-    uint32_t ir = batchIR[i], rd = batchRED[i];
+  for (int i = 0; i < n; i++) {
+    uint32_t ir = batchIR[base + i], rd = batchRED[base + i];
     pkt[off++] = ir & 0xFF; pkt[off++] = (ir >> 8) & 0xFF; pkt[off++] = (ir >> 16) & 0xFF; pkt[off++] = (ir >> 24) & 0xFF;
     pkt[off++] = rd & 0xFF; pkt[off++] = (rd >> 8) & 0xFF; pkt[off++] = (rd >> 16) & 0xFF; pkt[off++] = (rd >> 24) & 0xFF;
   }
   pChar->setValue(pkt, off);
-  if (deviceConnected) pChar->notify();
+  pChar->notify();
+}
+
+void sendBatch() {
+  if (!deviceConnected) { batchN = 0; return; }   // 未连接不浪费, 直接丢弃缓冲
+
+  // 按协商后的 ATT MTU 决定单包最多放几个样本, 防止 MTU 未协商成功时大包被丢弃/截断造成断流。
+  // 单 notify 有效负载 = MTU-3; 包头 5 字节; 每样本 8 字节。
+  uint16_t mtu = pServer->getPeerMTU(pServer->getConnId());
+  if (mtu < 23) mtu = 23;                          // BLE 默认 MTU 下限
+  int maxS = ((int)mtu - 3 - 5) / 8;
+  if (maxS < 1)     maxS = 1;
+  if (maxS > BATCH) maxS = BATCH;
+
+  uint32_t first = sampleIndex - batchN;           // 本批第一个样本的绝对序号
+  int sent = 0;
+  while (sent < batchN) {
+    int n = batchN - sent; if (n > maxS) n = maxS;
+    notifyChunk(first + sent, sent, n);
+    sent += n;
+  }
   batchN = 0;
 }
 

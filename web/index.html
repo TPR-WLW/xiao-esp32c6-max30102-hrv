@@ -149,6 +149,7 @@ let rrSeries=[];             // {idx,rr}
 let wave=[];                 // {idx,v,beat,finger} 表示用
 let spIR=[], spRED=[];       // SpO2 用リングバッファ
 let lastIRv=0, lastFinger=false, sampleClock=0, spsCount=0, curSpo2=null;
+let waveDirty=false;          // 有新样本待绘制 -> requestAnimationFrame 实时刷新
 let logRows=[], logPaused=false;
 const WIN=60;                // HRV 計算ビート数
 
@@ -275,7 +276,7 @@ function acceptRR(rr){
   }
   return true;
 }
-function pushWave(idx,v,beat,finger){ wave.push({idx,v,beat,finger}); if(wave.length>500) wave.shift(); }
+function pushWave(idx,v,beat,finger){ wave.push({idx,v,beat,finger}); if(wave.length>500) wave.shift(); waveDirty=true; }
 
 // ---- SpO2 (R比値) ----
 function computeSpo2(){
@@ -347,7 +348,6 @@ setInterval(()=>{
   $('sensor').textContent=online?'オンライン':'オフライン'; $('sensor').className='badge '+(online?'ok':'no');
   $('sps').textContent=online?('受信 '+spsCount+' サンプル/秒'):''; spsCount=0;
   if(!lastFinger){ $('bpm').textContent='--'; }
-  drawWave();
 },1000);
 setInterval(()=>{ if(!lastTs){$('age').textContent='--';return;} const s=Math.round((Date.now()-lastTs)/1000); $('age').textContent=s<1?'今':(s+'秒前'); },500);
 
@@ -391,6 +391,10 @@ function drawPoincare(arr){
     ctx.fillStyle='#8b91a7'; ctx.font='11px sans-serif'; ctx.fillText('SD1='+h.sd1.toFixed(1)+'  SD2='+h.sd2.toFixed(1)+' ms',pad+6,pad+6); }
 }
 drawWave(); drawTacho([]); drawPoincare([]);
+
+// 实时波形: 有新样本就在下一帧重绘(~60fps), 取代原来每秒一次的卡顿刷新
+function renderLoop(){ if(waveDirty){ waveDirty=false; drawWave(); } requestAnimationFrame(renderLoop); }
+requestAnimationFrame(renderLoop);
 </script>
 </body>
 </html>
