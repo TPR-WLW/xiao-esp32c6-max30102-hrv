@@ -1,65 +1,121 @@
-# XIAO ESP32-C6 + MAX30102: pulse, SpO₂ and HRV over BLE
+# XIAO ESP32-C6 + MAX30102 — BLE PPG streamer (technical reference)
 
-> English | [中文](README.zh-CN.md) | [日本語](README.ja.md)
+> English | [日本語](README.ja.md)
 
-A small heart-rate, SpO₂ and HRV monitor. The board reads an optical pulse
-sensor and streams the raw light over Bluetooth. A web page does everything else.
+Raw photoplethysmography (PPG) acquisition on a Seeed XIAO ESP32-C6 with a
+MAX30102, streamed over BLE. All signal processing — beat detection, RR
+intervals, time-domain HRV, SpO₂ — runs in a browser over Web Bluetooth. This is
+the technical reference. (Backup mirror; EN/JA only.)
 
-I built it because I wanted to watch my own heart-rate variability without buying
-a chest strap, and because I was curious how far a five-dollar sensor and a
-browser could go.
+## System overview
 
-## The idea
+```
+MAX30102 --I2C(0x57,400kHz)--> XIAO ESP32-C6 --BLE GATT notify--> Browser (Chrome/Edge)
+  Red+IR PPG                    FIFO drain + batch                DSP: detect/RR/HRV/SpO2 + render
+```
 
-The device is dumb on purpose. The ESP32 reads the MAX30102 and pushes raw
-IR/RED samples over BLE at 100 Hz. No filtering, no beat detection, no math on
-the chip.
+The MCU runs no algorithms by design. The ESP32-C6 (RISC-V, single core) has no
+FPU, so floating-point DSP is software-emulated and slow, and it contends with
+the BLE host for the core. Moving all computation to the client removes that
+limit and lets algorithms change without reflashing.
 
-Everything that turns those numbers into something meaningful runs in the
-browser, in plain JavaScript: beat detection, the spacing between beats, HRV,
-SpO₂, and the live waveform.
+Not a medical device. A MAX30102 yields pulse-rate variability (PRV), an
+approximation of ECG-derived HRV that holds mainly at rest.
 
-Two reasons I split it this way:
+## Hardware / wiring
 
-- The C6 has no hardware floating-point unit. Anything heavier than integer math
-  runs in software emulation, which is slow, and with the BLE stack fighting for
-  the same single core it was occasionally enough to stall the loop. (That cost
-  me an evening. The firmware now does as little as possible and the problem went
-  away.)
-- When the algorithms live in the page, changing one is a text edit. I got tired
-  of reflashing every time I wanted to nudge the beat detector. Now I save the
-  HTML and refresh.
+| MAX30102 | XIAO ESP32-C6 | |
+|----------|---------------|--|
+| VIN | 3V3 | sensor is 3.3 V; do not use 5 V |
+| GND | GND | |
+| SDA | D4 / GPIO22 | I²C data |
+| SCL | D5 / GPIO23 | I²C clock |
 
-It runs the same on Windows, macOS and Linux as long as you have Chrome or Edge,
-with nothing to install.
+I²C address `0x57`, bus at 400 kHz. A scan that returns nothing while the
+pull-ups read healthy almost always means SDA and SCL are swapped.
 
-It's a learning project, not a medical device. A MAX30102 measures pulse-rate
-variability (PRV). At rest that tracks ECG-derived HRV fairly well; during
-movement it doesn't, and the absolute numbers shouldn't be taken too seriously.
+## Sensor configuration
 
-## Hardware
+SparkFun `MAX30105` driver, initialised as:
 
-- Seeed XIAO ESP32-C6
-- MAX30102 breakout (the common purple GY-MAX30102 works)
-- Four jumper wires
+| Parameter | Value | Note |
+|-----------|-------|------|
+| LED mode | 2 | Red + IR |
+| Sample rate | 400 Hz | internal |
+| Sample averaging | 4 | → 100 Hz effective |
+| Pulse width | 411 µs | 18-bit ADC |
+| ADC range | 4096 nA | |
+| LED amplitude (Red, IR) | 0x24 | ≈ 7 mA |
 
-Wiring (I²C):
+Effective output rate = 400 / 4 = **100 Hz**. The firmware drains the FIFO with
+`getFIFOIR()` / `getFIFORed()` (tail reads) and `nextSample()`. No filtering or
+detection on the device.
 
-| MAX30102 | XIAO ESP32-C6 |
-|----------|---------------|
-| VIN      | 3V3           |
-| GND      | GND           |
-| SDA      | D4 (GPIO22)   |
-| SCL      | D5 (GPIO23)   |
+## BLE GATT
 
-Power from 3V3, not 5V. The sensor sits at I²C address 0x57. If a scan finds
-nothing, check whether SDA and SCL are swapped before anything else. They were,
-for me, and the symptom is maddening: the pull-ups read fine, the bus looks
-healthy, and the chip just never answers.
+| | UUID |
+|--|------|
+| Service | `12345678-1234-5678-1234-56789abcdef0` |
+| Characteristic (notify) | `12345678-1234-5678-1234-56789abcdef1` |
 
-## Firmware
+Device name `XIAO-HR`. Requested ATT MTU 247. Each notification carries a batch
+of samples.
 
-Built with arduino-cli and the Espressif ESP32 core.
+### Packet layout (little-endian)
+
+| Offset | Type | Field |
+|--------|------|-------|
+| 0 | uint32 | `firstIndex` — absolute sample number of sample 0 in this packet |
+| 4 | uint8 | `count` — sample count (16 in this build) |
+| 5 + 8k | uint32 | `ir[k]` |
+| 9 + 8k | uint32 | `red[k]` |
+
+Packet size = 5 + 8·count = **133 bytes** at count = 16. Notify rate ≈ 100 / 16
+≈ **6.25 Hz**. `firstIndex` lets the client order packets and detect loss; the
+100 Hz sample rate is fixed and assumed client-side.
+
+A stall watchdog re-initialises the sensor only after >5 s without samples (long
+enough not to trip on BLE contention) and resets no detector state — detection
+lives on the client.
+
+Serial debug at 115200 baud prints one line per second: `sps`, sample index,
+last IR value, connection flag.
+
+## Client processing (`web/index.html`, vanilla JS)
+
+All tunables are in `const P` at the top of the script.
+
+**Beat detection, per IR sample:**
+
+- DC estimate: `dc += (ir − dc)·α`, α = 0.005, so τ ≈ 1/(α·fs) ≈ 2 s — a ~0.08 Hz
+  high-pass, slow enough not to attenuate the pulse.
+- AC: `ac = ir − dc`, then low-pass `acLP += (ac − acLP)·0.4`.
+- Envelope: `envPos` / `envNeg` decay ×0.995 per sample, tracking max/min of
+  `acLP`. Threshold = `envNeg + 0.55·(envPos − envNeg)`; minimum peak-to-peak
+  amplitude 200.
+- Peak: a local maximum of `acLP` above threshold, refined to sub-sample position
+  by parabolic interpolation of its three neighbours:
+  `offset = 0.5·(y₋₁ − y₊₁) / (y₋₁ − 2y₀ + y₊₁)`.
+- Refractory 300 ms; accepted RR ∈ [300, 2000] ms (30–200 BPM).
+
+**RR / HRV:**
+
+- `RR = (peakIndexᵢ − peakIndexᵢ₋₁) / fs · 1000` ms, derived from sample indices
+  so BLE jitter does not affect it.
+- Artifact rejection: drop RR if `|RR − median(last 11)| > 0.30 · median`.
+- Sliding window of the last 60 intervals: mean RR, SDNN, RMSSD, pNN50; Poincaré
+  `SD1 = √0.5 · SDSD`, `SD2 = √(2·SDNN² − SD1²)`.
+
+**SpO₂ (ratio-of-ratios):**
+
+- Window ≈ 3 s (300 samples). `DC = mean`, `AC = RMS(x − DC)` for Red and IR.
+- `R = (AC_red/DC_red) / (AC_ir/DC_ir)`, `SpO₂ = clamp(110 − 25R, 70, 100)`.
+  Requires `DC_ir > 50000` (finger present) and `AC > 20`. Uncalibrated.
+
+Finger gate `IR > 50000`. The client auto-reconnects (1.5 s retry) on
+`gattserverdisconnected`.
+
+## Build & flash
 
 ```bash
 arduino-cli config add board_manager.additional_urls \
@@ -67,79 +123,19 @@ arduino-cli config add board_manager.additional_urls \
 arduino-cli core update-index
 arduino-cli core install esp32:esp32
 arduino-cli lib install "SparkFun MAX3010x Pulse and Proximity Sensor Library"
-
-# compile and upload; use your own serial port
-arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C6 -u \
-  -p /dev/cu.usbmodemXXXX max30102_ble
+arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C6 -u -p <PORT> max30102_ble
 ```
 
-The MAX30102 is set to Red+IR at a 400 Hz internal rate with 4× averaging, so it
-delivers 100 effective samples a second. The firmware drains the sensor FIFO,
-packs samples into small batches, and notifies. It keeps no history and runs no
-DSP; if you read the loop it's almost boring, which is the point.
+Open `web/index.html` in Chrome or Edge (Web Bluetooth required), connect to
+`XIAO-HR`, and place a fingertip on the sensor window.
 
-It advertises as `XIAO-HR`. Over USB serial at 115200 it prints one line a second
-(sample rate, running sample index, last IR value, whether a central is
-connected), so you can confirm it's alive without a finger on the sensor.
-
-### BLE format
-
-One service, one notify characteristic. Each notification is a little-endian
-binary packet:
+## Repository
 
 ```
-[uint32 firstIndex][uint8 count][ count × (uint32 ir, uint32 red) ]
-```
-
-- `firstIndex` is the absolute sample number of the first sample. The browser
-  uses it to rebuild the timeline and to notice a dropped packet.
-- `count` is 16 in this build, so about six notifications a second. Bigger
-  batches mean fewer notifications and less load on the radio, while staying
-  small enough to fit a normally negotiated MTU.
-- The rate is fixed at 100 Hz, which the browser hard-codes to turn sample
-  indices into time.
-
-Service `12345678-1234-5678-1234-56789abcdef0`, characteristic `…def1`.
-
-## The web app
-
-`web/index.html` is one file: no dependencies, no build, no server. Double-click
-it. Use Chrome or Edge; Safari and Firefox don't implement Web Bluetooth.
-
-Connect, pick `XIAO-HR`, rest a fingertip on the window and hold still. After a
-few seconds you get the pulse waveform with a dot on each detected beat, heart
-rate, SpO₂, and the HRV panel. It speaks English, Chinese and Japanese, logs
-every packet, exports CSV, and reconnects on its own if the link drops.
-
-What happens under the hood:
-
-- **Beat detection.** The raw IR is high-passed by subtracting a slow exponential
-  moving average (about a two-second time constant), which removes baseline drift
-  without flattening the pulse; get that time constant wrong and you detect
-  nothing. A light low-pass smooths the rest. Peaks are found against an adaptive
-  threshold from a decaying envelope, with a refractory period so the dicrotic
-  notch isn't counted as a second beat.
-- **RR timing.** Each peak is refined with a parabolic fit over its three
-  neighbouring samples, which pushes the interval resolution below the 10 ms
-  sample spacing. RR is measured from sample indices, not wall-clock time, so
-  Bluetooth jitter doesn't smear it.
-- **HRV.** Time-domain only: mean RR, RMSSD, pNN50, SDNN, plus SD1/SD2 from the
-  Poincaré cloud. Intervals more than 30% off the local median are dropped first,
-  so a single missed or doubled beat doesn't wreck the numbers.
-- **SpO₂.** The usual ratio-of-ratios, R = (AC_red/DC_red) / (AC_ir/DC_ir) over a
-  few seconds, mapped with the standard linear approximation and clamped. It's
-  uncalibrated, so treat it as a ballpark.
-
-The beat-detector constants are in one object at the top of the script
-(`const P`). Since it's all in the page, tuning is edit-and-refresh.
-
-## Layout
-
-```
-max30102_ble/    firmware — streams raw IR/RED over BLE
-web/index.html   the web app
-i2c_diag/        a standalone I²C scanner I used while wiring
-max30102_xiao/   the first version, serial only, kept for reference
+max30102_ble/    firmware — raw IR/RED BLE streamer
+web/index.html   client — Web Bluetooth + all DSP
+i2c_diag/        I²C bus scanner / line-level probe
+max30102_xiao/   serial-only heart-rate prototype
 ```
 
 ## License
